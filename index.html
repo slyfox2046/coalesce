@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Coalesce · 粒子汇聚</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: radial-gradient(ellipse at center, #0b2438 0%, #000 68%);
+      overflow: hidden;
+    }
+    canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="stage"></canvas>
+  <script>
+    // 画面上的 Logo = 原图像素尺寸的 1/3（1085×1200 → 约 362×400）
+    const DISPLAY_SCALE = 1 / 3
+
+    // 右下角有一行水印，采样和清晰 Logo 都要避开它
+    const WATERMARK = { x: 790, y: 1186 }
+
+    const easeOutCubic = (t) => 1 - Math.pow(1 - t, 3)
+    const easeOutQuint = (t) => 1 - Math.pow(1 - t, 5)
+    // 收回时会略微越过终点再弹回来，Logo 会有一下“呼吸”
+    const easeOutBack = (t) => {
+      const c = 1.7
+      return 1 + (c + 1) * Math.pow(t - 1, 3) + c * Math.pow(t - 1, 2)
+    }
+
+    function clamp(v, a, b) {
+      return v < a ? a : v > b ? b : v
+    }
+
+    const canvas = document.getElementById('stage')
+    const ctx = canvas.getContext('2d')
+
+    const img = new Image()
+    img.src = 'images/telecom.png'
+    img.onload = start
+    img.onerror = () => {
+      document.body.textContent = 'Logo 图片加载失败，请确认 images/telecom.png 存在。'
+    }
+
+    let particles = []
+    let dust = []
+    let glowCanvas = null
+    let logoCanvas = null
+    let logoW = 0
+    let logoH = 0
+    let cssW = 0
+    let cssH = 0
+    let dpr = 1
+
+    // progress：1 = 完全炸开，0 = 聚拢完成。整场动画只靠这一个数驱动
+    let progress = 1
+    let progressSmooth = 1
+    let burst = 0
+    let burstSmooth = 0
+    let waveT = -1
+    let queue = []
+    let stepT = 0
+    let reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+
+    function play(steps) {
+      queue = steps.slice()
+      stepT = 0
+    }
+
+    let finished = false
+
+    // 只播一次：先聚成 Logo，停一下，炸开，再收回。播完就停
+    function opening() {
+      play([
+        { from: 1, to: 0, dur: 2.6, ease: easeOutQuint },
+        { from: 0, to: 0, dur: 1.15 },
+        { from: 0, to: 1, dur: 0.75, ease: easeOutCubic, burst: 1, wave: true },
+        { from: 1, to: 0, dur: 3.75, ease: easeOutBack, burst: 0.2 },
+      ])
+    }
+
+    function updateTimeline(dt) {
+      if (!queue.length) return
+      const step = queue[0]
+      stepT += dt
+      const t = Math.min(1, stepT / step.dur)
+      const eased = step.ease ? step.ease(t) : t
+      progress = step.from + (step.to - step.from) * eased
+      // 爆炸中段亮一下，头尾暗下去
+      burst = (step.burst || 0) * Math.sin(Math.PI * t)
+      waveT = step.wave ? t : -1
+      if (t >= 1) {
+        queue.shift()
+        stepT = 0
+        if (!queue.length) finished = true
+      }
+    }
+
+    /**
+     * 从 Logo 位图里采样粒子。
+     * 透明像素丢掉；不透明像素的位置就是碎片的“家”。
+     * 坐标以图片中心为原点、图片高度为 1，这样换屏幕大小时不用重算粒子。
+     */
+    function buildParticles(image) {
+      const iw = image.naturalWidth
+      const ih = image.naturalHeight
+      const off = document.createElement('canvas')
+      off.width = iw
+      off.height = ih
+      const octx = off.getContext('2d', { willReadFrequently: true })
+      octx.drawImage(image, 0, 0)
+      // 直接双击 html 时，浏览器会把本地图片当成“跨域”，这里会读失败
+      let px
+      try {
+        px = octx.getImageData(0, 0, iw, ih).data
+      } catch (err) {
+        showOpenTip()
+        return null
+      }
+
+      let transparent = 0
+      const total = iw * ih
+      for (let i = 3; i < px.length; i += 4) {
+        if (px[i] < 250) transparent++
+      }
+      const isTransparent = transparent > total * 0.05
+
+      // 每隔 2 像素扫一次：后面还会随机降到几千个，没必要把 100 多万像素都留下
+      const SCAN = 2
+      const pts = []
+      for (let y = 0; y < ih; y += SCAN) {
+        for (let x = 0; x < iw; x += SCAN) {
+          if (y >= WATERMARK.y && x >= WATERMARK.x) continue
+          const o = (y * iw + x) * 4
+          let w = 0
+          if (isTransparent) {
+            if (px[o + 3] > 32) w = px[o + 3] / 255
+          } else {
+            const diff = 255 - Math.min(px[o], px[o + 1], px[o + 2])
+            if (diff > 2) w = Math.min(1, diff / 6)
+          }
+          if (w > 0) pts.push(x, y, w, px[o], px[o + 1], px[o + 2])
+        }
+      }
+
+      const MAX = Math.max(2000, Math.min(16000, Math.round((iw * ih) / 200)))
+      const available = pts.length / 6
+      const count = Math.min(MAX, Math.floor(available))
+      const step = available / count
+      const list = []
+
+      for (let k = 0; k < count; k++) {
+        const i0 = Math.floor(k * step)
+        const i1 = Math.max(i0 + 1, Math.floor((k + 1) * step))
+        const pick = i0 + Math.floor(Math.random() * (i1 - i0))
+        const base = Math.min(pick, available - 1) * 6
+        const sx = pts[base]
+        const sy = pts[base + 1]
+
+        // 家位置：u 向右，v 向上
+        const u = (sx - iw / 2) / ih + (Math.random() - 0.5) / ih
+        const v = -((sy - ih / 2) / ih) + (Math.random() - 0.5) / ih
+
+        // 随机单位向量，用来打乱纯粹的“从中心炸开”
+        let jx = Math.random() * 2 - 1
+        let jy = Math.random() * 2 - 1
+        let jz = Math.random() * 2 - 1
+        const jl = Math.hypot(jx, jy, jz) || 1
+        jx /= jl
+        jy /= jl
+        jz /= jl
+
+        // 径向单位向量。靠中心太近时方向不稳定，改用随机方向
+        const rl = Math.hypot(u, v)
+        const rx = rl < 0.02 ? jx : u / rl
+        const ry = rl < 0.02 ? jy : v / rl
+
+        // 70% 沿径向，30% 随机：炸开后还能看出 Logo 轮廓
+        const R = 0.7
+        let ex = rx * R + jx * (1 - R)
+        let ey = ry * R + jy * (1 - R)
+        let ez = jz * (1 - R) * 1.5
+        const el = Math.hypot(ex, ey, ez) || 1
+        const mag = 0.3 + Math.pow(Math.random(), 1.6) * 1.05
+        ex = (ex / el) * mag
+        ey = (ey / el) * mag
+        ez = (ez / el) * mag
+
+        list.push({
+          tx: u,
+          ty: v,
+          tz: 0,
+          ex,
+          ey,
+          ez,
+          rnd: Math.random(),
+          weight: pts[base + 2],
+          r: pts[base + 3],
+          g: pts[base + 4],
+          b: pts[base + 5],
+        })
+      }
+      return list
+    }
+
+    function makeGlow() {
+      const c = document.createElement('canvas')
+      c.width = c.height = 512
+      const g = c.getContext('2d')
+      const rad = g.createRadialGradient(256, 256, 0, 256, 256, 256)
+      rad.addColorStop(0, 'rgba(40, 170, 255, 0.65)')
+      rad.addColorStop(0.28, 'rgba(0, 110, 190, 0.28)')
+      rad.addColorStop(1, 'rgba(0, 80, 160, 0)')
+      g.fillStyle = rad
+      g.fillRect(0, 0, 512, 512)
+      return c
+    }
+
+    function makeDust(n) {
+      const list = []
+      for (let i = 0; i < n; i++) {
+        list.push({
+          x: Math.random(),
+          y: Math.random(),
+          r: Math.random() * 1.3 + 0.3,
+          a: Math.random() * 0.22 + 0.04,
+          sp: Math.random() * 0.012 + 0.003,
+          ph: Math.random() * Math.PI * 2,
+        })
+      }
+      return list
+    }
+
+    // 清晰 Logo 提前画到一张小画布上，每帧只贴图，不再缩放原图
+    function renderLogoCanvas() {
+      logoCanvas = document.createElement('canvas')
+      logoCanvas.width = Math.max(1, Math.round(logoW * dpr))
+      logoCanvas.height = Math.max(1, Math.round(logoH * dpr))
+      const lctx = logoCanvas.getContext('2d')
+      lctx.imageSmoothingEnabled = true
+      lctx.imageSmoothingQuality = 'high'
+      lctx.drawImage(img, 0, 0, logoCanvas.width, logoCanvas.height)
+      const cutX = Math.floor((WATERMARK.x / img.naturalWidth) * logoCanvas.width)
+      const cutY = Math.floor((WATERMARK.y / img.naturalHeight) * logoCanvas.height)
+      lctx.clearRect(cutX, cutY, logoCanvas.width - cutX, logoCanvas.height - cutY)
+    }
+
+    function layout() {
+      dpr = Math.min(window.devicePixelRatio || 1, 2)
+      cssW = window.innerWidth
+      cssH = window.innerHeight
+      // 物理像素 = CSS 像素 × DPR，否则高分屏上会糊，或整幅画缩在左上角
+      canvas.width = Math.round(cssW * dpr)
+      canvas.height = Math.round(cssH * dpr)
+
+      const baseW = img.naturalWidth * DISPLAY_SCALE
+      const baseH = img.naturalHeight * DISPLAY_SCALE
+      // 基准就是原图的 1/3；窗口比它还小时再缩小，避免被裁切
+      const fit = Math.min(1, (cssW * 0.92) / baseW, (cssH * 0.88) / baseH)
+      logoW = baseW * fit
+      logoH = baseH * fit
+      renderLogoCanvas()
+    }
+
+    function logoFade(p) {
+      // 收拢过半（progress < 0.55）后，清晰 Logo 淡入
+      let a = clamp((0.55 - p) / 0.45, 0, 1)
+      return a * a * (3 - 2 * a)
+    }
+
+    function drawDust(time) {
+      ctx.save()
+      ctx.globalCompositeOperation = 'lighter'
+      for (const d of dust) {
+        const x = (d.x + Math.sin(time * d.sp + d.ph) * 0.02) * cssW
+        const y = ((d.y + time * d.sp * 0.15) % 1) * cssH
+        ctx.fillStyle = `rgba(150, 200, 255, ${d.a})`
+        ctx.fillRect(x, y, d.r, d.r)
+      }
+      ctx.restore()
+    }
+
+    function drawGlow(p) {
+      const gathered = 1 - clamp(p, 0, 1)
+      const alpha = 0.08 + gathered * 0.72 + burstSmooth * 0.35
+      const size = logoH * (1.55 + burstSmooth * 0.35)
+      ctx.save()
+      ctx.globalCompositeOperation = 'lighter'
+      ctx.globalAlpha = alpha
+      ctx.drawImage(glowCanvas, cssW / 2 - size / 2, cssH / 2 - size / 2, size, size)
+      ctx.restore()
+    }
+
+    function drawShockwave() {
+      if (waveT < 0) return
+      const radius = waveT * logoH * 0.95
+      const alpha = (1 - waveT) * 0.7
+      ctx.save()
+      ctx.beginPath()
+      ctx.arc(cssW / 2, cssH / 2, Math.max(1, radius), 0, Math.PI * 2)
+      ctx.strokeStyle = `rgba(170, 220, 255, ${alpha})`
+      ctx.lineWidth = 2 + (1 - waveT) * 8
+      ctx.stroke()
+      ctx.restore()
+    }
+
+    function drawParticles(time) {
+      const p = progressSmooth
+      const logoA = logoFade(p)
+      if (logoA > 0.985) return
+
+      const s = logoH
+      const cx = cssW / 2
+      const cy = cssH / 2
+      const dotPx = Math.max(1.15, logoH / 170)
+      const over = 1 + Math.min(0, p) * 0.55
+
+      ctx.save()
+      ctx.globalCompositeOperation = 'lighter'
+      for (const pt of particles) {
+        const rnd = pt.rnd
+        // 每个粒子晚一点才动身，聚拢时像沙漏一样陆续落定
+        const delay = rnd * 0.42
+        let pp = clamp((p - delay) / (1 - delay), 0, 1)
+        pp = 1 - Math.pow(1 - pp, 3)
+
+        const idle = 1 - pp
+        const ax = pt.tx + Math.sin(time * 0.7 + rnd * 41) * 0.0032 * idle
+        const ay = pt.ty + Math.cos(time * 0.9 + rnd * 23) * 0.0032 * idle
+
+        // 绕竖直轴转一点，炸开时带螺旋，而不是直线飞出
+        const ang = pp * (1 + rnd * 2.6)
+        const cos = Math.cos(ang)
+        const sin = Math.sin(ang)
+        let bx = pt.tx + pt.ex
+        const bz = pt.tz + pt.ez
+        bx = bx * cos - bz * sin
+        const by = ay + pt.ey + pp * (rnd - 0.5) * 0.62
+
+        const mx = ax + (bx - ax) * pp
+        const my = ay + (by - ay) * pp
+        const sx = cx + mx * over * s
+        const sy = cy - my * over * s
+
+        const size = dotPx * (0.7 + rnd * 1.2) * (1 + pp * 0.55 + burstSmooth * 0.65)
+        const flick = 0.9 + 0.1 * Math.sin(time * 2.1 + rnd * 90)
+        const alpha = pt.weight * (0.75 + 0.25 * pp) * flick * (1 - logoA)
+        if (alpha < 0.03) continue
+
+        // 飞散时略微提亮，叠在一起会发白光
+        const boost = 1 + pp * 0.45 + burstSmooth * 0.35
+        const r = Math.min(255, pt.r * boost)
+        const g = Math.min(255, pt.g * boost)
+        const b = Math.min(255, pt.b * boost)
+        ctx.fillStyle = `rgba(${r | 0},${g | 0},${b | 0},${alpha.toFixed(3)})`
+        ctx.fillRect(sx - size / 2, sy - size / 2, size, size)
+      }
+      ctx.restore()
+    }
+
+    function drawSharpLogo() {
+      const a = logoFade(progressSmooth)
+      if (a <= 0) return
+      ctx.save()
+      ctx.globalAlpha = a
+      ctx.drawImage(
+        logoCanvas,
+        cssW / 2 - logoW / 2,
+        cssH / 2 - logoH / 2,
+        logoW,
+        logoH,
+      )
+      ctx.restore()
+    }
+
+    function frame(now) {
+      const dt = Math.min(0.05, (now - (frame.last || now)) / 1000)
+      frame.last = now
+      const time = now / 1000
+
+      if (!reducedMotion && !finished) {
+        updateTimeline(dt)
+      }
+      progressSmooth += (progress - progressSmooth) * Math.min(1, dt * 8)
+      burstSmooth += (burst - burstSmooth) * Math.min(1, dt * 7)
+      if (finished && Math.abs(progress - progressSmooth) < 0.001) progressSmooth = progress
+
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+      ctx.clearRect(0, 0, cssW, cssH)
+
+      if (reducedMotion) {
+        ctx.drawImage(logoCanvas, cssW / 2 - logoW / 2, cssH / 2 - logoH / 2, logoW, logoH)
+        return
+      }
+
+      drawDust(time)
+      drawGlow(progressSmooth)
+      drawParticles(time)
+      drawShockwave()
+      drawSharpLogo()
+      // 队列播完并且画面跟上进度后就停，不再炸开第二次
+      if (!(finished && progressSmooth === progress)) requestAnimationFrame(frame)
+    }
+
+    function showOpenTip() {
+      const tip = document.createElement('p')
+      tip.textContent = '请不要直接双击打开。在项目目录运行 python3 -m http.server 8731，然后访问 http://127.0.0.1:8731/'
+      tip.style.cssText = 'position:fixed;left:24px;right:24px;top:24px;color:#b9dcff;font:16px/1.6 sans-serif;'
+      document.body.appendChild(tip)
+    }
+
+    function start() {
+      particles = buildParticles(img)
+      if (!particles) return
+      dust = makeDust(300)
+      glowCanvas = makeGlow()
+      layout()
+      window.addEventListener('resize', layout)
+
+      if (reducedMotion) {
+        frame(performance.now())
+        return
+      }
+      opening()
+      requestAnimationFrame(frame)
+    }
+  </script>
+</body>
+</html>

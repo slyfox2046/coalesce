@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Coalesce · 从左飞入</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: radial-gradient(ellipse at center, #0b2438 0%, #000 68%);
+      overflow: hidden;
+    }
+    canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="stage"></canvas>
+  <script>
+    // 画面上的 Logo = 原图像素尺寸的 1/3，并贴在屏幕最右边
+    const DISPLAY_SCALE = 1 / 3
+    const RIGHT_PAD = 36
+
+    // 右下角有一行水印，采样和清晰 Logo 都要避开它
+    const WATERMARK = { x: 790, y: 1186 }
+
+    // 只飞一次，汇成 Logo 后停住
+    const FLY_DUR = 4.8
+
+    // 先快后慢：很快离开左边，在右边慢下来聚成 Logo，左边就不会堆成一团
+    const easeOutCubic = (t) => 1 - Math.pow(1 - t, 3)
+
+    function clamp(v, a, b) {
+      return v < a ? a : v > b ? b : v
+    }
+
+    const canvas = document.getElementById('stage')
+    const ctx = canvas.getContext('2d')
+
+    const img = new Image()
+    img.src = 'images/telecom.png'
+    img.onload = start
+    img.onerror = () => {
+      document.body.textContent = 'Logo 图片加载失败，请确认 images/telecom.png 存在。'
+    }
+
+    let particles = []
+    let glowCanvas = null
+    let logoCanvas = null
+    let logoW = 0
+    let logoH = 0
+    let logoX = 0
+    let logoY = 0
+    let cssW = 0
+    let cssH = 0
+    let dpr = 1
+
+    // progress：0 = 还没出发（画面上没有粒子），1 = 已经在右边拼好
+    let progress = 0
+    let progressSmooth = 0
+    // fly 正在飞，done 已经汇好，不再重来
+    let phase = 'fly'
+    let phaseT = 0
+    let reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+
+    function updatePhase(dt) {
+      if (phase !== 'fly') return
+      phaseT += dt
+      progress = clamp(phaseT / FLY_DUR, 0, 1)
+      if (phaseT >= FLY_DUR) {
+        phase = 'done'
+        progress = 1
+      }
+    }
+
+    /**
+     * 从 Logo 位图里采样粒子。
+     * 每个粒子只记住自己在 Logo 上的位置（家），出发地在绘制时算，这样改窗口大小不用重采样。
+     */
+    function buildParticles(image) {
+      const iw = image.naturalWidth
+      const ih = image.naturalHeight
+      const off = document.createElement('canvas')
+      off.width = iw
+      off.height = ih
+      const octx = off.getContext('2d', { willReadFrequently: true })
+      octx.drawImage(image, 0, 0)
+      let px
+      try {
+        px = octx.getImageData(0, 0, iw, ih).data
+      } catch (err) {
+        showOpenTip()
+        return null
+      }
+
+      let transparent = 0
+      const total = iw * ih
+      for (let i = 3; i < px.length; i += 4) {
+        if (px[i] < 250) transparent++
+      }
+      const isTransparent = transparent > total * 0.05
+
+      const SCAN = 2
+      const pts = []
+      for (let y = 0; y < ih; y += SCAN) {
+        for (let x = 0; x < iw; x += SCAN) {
+          if (y >= WATERMARK.y && x >= WATERMARK.x) continue
+          const o = (y * iw + x) * 4
+          let w = 0
+          if (isTransparent) {
+            if (px[o + 3] > 32) w = px[o + 3] / 255
+          } else {
+            const diff = 255 - Math.min(px[o], px[o + 1], px[o + 2])
+            if (diff > 2) w = Math.min(1, diff / 6)
+          }
+          if (w > 0) pts.push(x, y, w, px[o], px[o + 1], px[o + 2])
+        }
+      }
+
+      // 粒子少一些，左边才不会糊成一片
+      const MAX = 880
+      const available = pts.length / 6
+      const count = Math.min(MAX, Math.floor(available))
+      const step = available / count
+      const list = []
+
+      for (let k = 0; k < count; k++) {
+        const i0 = Math.floor(k * step)
+        const i1 = Math.max(i0 + 1, Math.floor((k + 1) * step))
+        const pick = i0 + Math.floor(Math.random() * (i1 - i0))
+        const base = Math.min(pick, available - 1) * 6
+        const sx = pts[base]
+        const sy = pts[base + 1]
+        const rnd = Math.random()
+
+        // 家位置：以图片中心为原点，图片高度为 1。u 向右，v 向上
+        const u = (sx - iw / 2) / ih + (rnd - 0.5) / ih
+        const v = -((sy - ih / 2) / ih) + (Math.random() - 0.5) / ih
+
+        // 陆续出发：同一时刻只有少数粒子刚出现在左边，飞到右边的会越积越多
+        const birth = rnd * 0.62
+
+        list.push({
+          tx: u,
+          ty: v,
+          rnd,
+          birth,
+          weight: pts[base + 2],
+          r: pts[base + 3],
+          g: pts[base + 4],
+          b: pts[base + 5],
+        })
+      }
+      return list
+    }
+
+    function makeGlow() {
+      const c = document.createElement('canvas')
+      c.width = c.height = 512
+      const g = c.getContext('2d')
+      const rad = g.createRadialGradient(256, 256, 0, 256, 256, 256)
+      rad.addColorStop(0, 'rgba(40, 170, 255, 0.65)')
+      rad.addColorStop(0.28, 'rgba(0, 110, 190, 0.28)')
+      rad.addColorStop(1, 'rgba(0, 80, 160, 0)')
+      g.fillStyle = rad
+      g.fillRect(0, 0, 512, 512)
+      return c
+    }
+
+    function renderLogoCanvas() {
+      logoCanvas = document.createElement('canvas')
+      logoCanvas.width = Math.max(1, Math.round(logoW * dpr))
+      logoCanvas.height = Math.max(1, Math.round(logoH * dpr))
+      const lctx = logoCanvas.getContext('2d')
+      lctx.imageSmoothingEnabled = true
+      lctx.imageSmoothingQuality = 'high'
+      lctx.drawImage(img, 0, 0, logoCanvas.width, logoCanvas.height)
+      const cutX = Math.floor((WATERMARK.x / img.naturalWidth) * logoCanvas.width)
+      const cutY = Math.floor((WATERMARK.y / img.naturalHeight) * logoCanvas.height)
+      lctx.clearRect(cutX, cutY, logoCanvas.width - cutX, logoCanvas.height - cutY)
+    }
+
+    function layout() {
+      dpr = Math.min(window.devicePixelRatio || 1, 2)
+      cssW = window.innerWidth
+      cssH = window.innerHeight
+      canvas.width = Math.round(cssW * dpr)
+      canvas.height = Math.round(cssH * dpr)
+
+      const baseW = img.naturalWidth * DISPLAY_SCALE
+      const baseH = img.naturalHeight * DISPLAY_SCALE
+      const fit = Math.min(1, (cssW - RIGHT_PAD * 2) / baseW, (cssH * 0.88) / baseH)
+      logoW = baseW * fit
+      logoH = baseH * fit
+      // 贴在最右边，垂直居中
+      logoX = cssW - RIGHT_PAD - logoW
+      logoY = (cssH - logoH) / 2
+      renderLogoCanvas()
+    }
+
+    // 等粒子基本都落到右边之后，清晰 Logo 才淡入，避免图片先于粒子出现
+    function logoFade(p) {
+      let a = clamp((p - 0.93) / 0.07, 0, 1)
+      return a * a * (3 - 2 * a)
+    }
+
+    function drawGlow(strength) {
+      if (strength <= 0.01) return
+      const size = logoH * 1.45
+      const cx = logoX + logoW / 2
+      const cy = logoY + logoH / 2
+      ctx.save()
+      ctx.globalCompositeOperation = 'lighter'
+      ctx.globalAlpha = 0.15 + strength * 0.7
+      ctx.drawImage(glowCanvas, cx - size / 2, cy - size / 2, size, size)
+      ctx.restore()
+    }
+
+    function drawParticles() {
+      const p = progressSmooth
+      const logoA = logoFade(p)
+      if (logoA > 0.985) return
+
+      const s = logoH
+      const cx = logoX + logoW / 2
+      const cy = logoY + logoH / 2
+      const dotPx = Math.max(1.15, logoH / 170)
+
+      ctx.save()
+      for (const pt of particles) {
+        // birth 之前这个粒子还不存在，所以最左边始终只有刚出发的那几个
+        const span = 1 - pt.birth
+        const t = clamp((p - pt.birth) / span, 0, 1)
+        if (t <= 0) continue
+
+        const move = easeOutCubic(t)
+        const homeX = cx + pt.tx * s
+        const homeY = cy - pt.ty * s
+        // 出发点挤在最左边的一条水平线上，上下高度是 0
+        const startX = -10 - pt.rnd * 20
+        const startY = cy
+        const x = startX + (homeX - startX) * move
+        // 走得越靠右，才从这条线慢慢拉开，变成 Logo 的高度
+        const along = clamp((x - startX) / (homeX - startX), 0, 1)
+        const y = startY + (homeY - startY) * along
+
+        const size = dotPx * (0.4 + along * 0.85) * (0.65 + pt.rnd * 0.45)
+        // 左边几乎看不见，越往右越清楚，但整体仍然偏透
+        const alpha = pt.weight * (0.03 + 0.9 * along * along) * (1 - logoA)
+        if (alpha < 0.012) continue
+
+        ctx.fillStyle = `rgba(${pt.r},${pt.g},${pt.b},${alpha.toFixed(3)})`
+        ctx.fillRect(x - size / 2, y - size / 2, size, size)
+      }
+      ctx.restore()
+    }
+
+    function drawSharpLogo() {
+      const a = logoFade(progressSmooth)
+      if (a <= 0.01) return
+      ctx.save()
+      ctx.globalAlpha = a
+      ctx.drawImage(logoCanvas, logoX, logoY, logoW, logoH)
+      ctx.restore()
+    }
+
+    function frame(now) {
+      const dt = Math.min(0.05, (now - (frame.last || now)) / 1000)
+      frame.last = now
+      if (!reducedMotion && phase === 'fly') {
+        updatePhase(dt)
+      }
+      progressSmooth += (progress - progressSmooth) * Math.min(1, dt * 8)
+      // 无限靠近 1 时收成整数，动画才能真正停下来
+      if (phase === 'done' && progress - progressSmooth < 0.001) progressSmooth = 1
+
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+      ctx.clearRect(0, 0, cssW, cssH)
+
+      if (reducedMotion) {
+        ctx.drawImage(logoCanvas, logoX, logoY, logoW, logoH)
+        return
+      }
+
+      drawGlow(logoFade(progressSmooth))
+      drawParticles()
+      drawSharpLogo()
+      // 汇好并显示清晰 Logo 后就停，不再预约下一帧
+      const settled = phase === 'done' && progressSmooth >= 1
+      if (!settled) requestAnimationFrame(frame)
+    }
+
+    function showOpenTip() {
+      const tip = document.createElement('p')
+      tip.textContent = '请不要直接双击打开。在项目目录运行 python3 -m http.server 8731，然后访问 http://127.0.0.1:8731/index2.html'
+      tip.style.cssText = 'position:fixed;left:24px;right:24px;top:24px;color:#b9dcff;font:16px/1.6 sans-serif;'
+      document.body.appendChild(tip)
+    }
+
+    function start() {
+      particles = buildParticles(img)
+      if (!particles) return
+      glowCanvas = makeGlow()
+      layout()
+      window.addEventListener('resize', layout)
+
+      if (reducedMotion) {
+        frame(performance.now())
+        return
+      }
+      requestAnimationFrame(frame)
+    }
+  </script>
+</body>
+</html>
